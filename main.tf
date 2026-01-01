@@ -12,17 +12,19 @@ terraform {
   }
 }
 
-# --- New: Dynamic AMI Lookup ---
-data "aws_ami" "amazon_linux_2023" {
+# --- 1. NEW: Ubuntu AMI Lookup ---
+# This ensures we get the correct, latest Ubuntu 24.04 image for eu-west-1
+data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["amazon"]
+  owners      = ["099720109477"] # Canonical's AWS ID
+
   filter {
     name   = "name"
-    values = ["al2023-ami-2023*-x86_64"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
 }
 
-# --- 1. Networking (VPC) ---
+# --- 2. Networking (VPC) ---
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 5.0"
@@ -34,7 +36,8 @@ module "vpc" {
   public_subnets  = ["10.0.1.0/24", "10.0.2.0/24"]
   private_subnets = ["10.0.101.0/24", "10.0.102.0/24"]
 
-  enable_nat_gateway = false 
+  map_public_ip_on_launch = true
+  enable_nat_gateway      = false 
   
   tags = {
     Terraform   = "true"
@@ -42,7 +45,7 @@ module "vpc" {
   }
 }
 
-# --- 2. Security Group ---
+# --- 3. Security Group ---
 resource "aws_security_group" "backend_sg" {
   name   = "much-to-do-backend-sg"
   vpc_id = module.vpc.vpc_id
@@ -61,6 +64,13 @@ resource "aws_security_group" "backend_sg" {
     cidr_blocks = ["0.0.0.0/0"] 
   }
 
+  ingress {
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -69,7 +79,7 @@ resource "aws_security_group" "backend_sg" {
   }
 }
 
-# --- 3. IAM & CloudWatch ---
+# --- 4. IAM & CloudWatch ---
 resource "aws_iam_role" "ec2_log_role" {
   name = "much-to-do-ec2-log-role"
   assume_role_policy = jsonencode({
@@ -92,15 +102,15 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   role = aws_iam_role.ec2_log_role.name
 }
 
-# --- 4. Frontend (S3 Only for now) ---
+# --- 5. Frontend (COMMENTED OUT) ---
+/*
 resource "aws_s3_bucket" "frontend" {
   bucket = "much-to-do-frontend-assets"
 }
+... (CloudFront config)
+*/
 
-# CLOUDFRONT IS DISABLED UNTIL ACCOUNT IS VERIFIED
-# resource "aws_cloudfront_distribution" "s3_distribution" { ... }
-
-# --- 5. Backend (EC2 in Public Subnets) ---
+# --- 6. Backend (Ubuntu EC2) ---
 module "ec2_instances" {
   source  = "terraform-aws-modules/ec2-instance/aws"
   version = "~> 5.0"
@@ -108,20 +118,45 @@ module "ec2_instances" {
   count = 2
   name  = "much-to-do-backend-${count.index}"
 
-  # Fixed: Using the dynamic AMI ID from the data source
-  ami                    = data.aws_ami.amazon_linux_2023.id
-  instance_type          = "t3.micro"
-  
-  subnet_id              = element(module.vpc.public_subnets, count.index)
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = "t3.micro"
+  subnet_id                   = element(module.vpc.public_subnets, count.index)
   associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.backend_sg.id]
+  iam_instance_profile        = aws_iam_instance_profile.ec2_profile.name
 
-  vpc_security_group_ids = [aws_security_group.backend_sg.id]
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+  # UBUNTU OPTIMIZED USER DATA
+  user_data = <<-EOF
+              #!/bin/bash
+              # Ubuntu uses apt, not yum
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -y
+              apt-get install -y golang
+              
+              # Create app in the correct /home/ubuntu directory
+              cat << 'GOAPP' > /home/ubuntu/main.go
+              package main
+              import (
+                "fmt"
+                "net/http"
+              )
+              func main() {
+                http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+                  fmt.Fprintf(w, "Hello from Much-To-Do Backend on Ubuntu!")
+                })
+                http.ListenAndServe(":8080", nil)
+              }
+              GOAPP
+              
+              # Ensure the ubuntu user owns the file and run it
+              chown ubuntu:ubuntu /home/ubuntu/main.go
+              sudo -u ubuntu go run /home/ubuntu/main.go &
+              EOF
 
   tags = { Name = "much-to-do-backend-${count.index}" }
 }
 
-# --- 6. Outputs ---
+# --- 7. Outputs ---
 output "backend_public_ips" {
   value = module.ec2_instances[*].public_ip
 }
